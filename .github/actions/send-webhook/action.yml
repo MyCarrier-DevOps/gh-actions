@@ -47,4 +47,4 @@ outputs:
     description: 'Body returned by the webhook request.'
 runs:
   using: docker
-  image: 'docker://ghcr.io/mycarrier-devops/actions/send-webhook:v1.0.0'
+  image: 'docker://ghcr.io/mycarrier-devops/actions/send-webhook:v1.0.1'
