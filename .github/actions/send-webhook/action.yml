@@ -1,0 +1,50 @@
+name: 'Send Webhook'
+description: 'Send webhook payloads using the upstream workflow-webhook script'
+inputs:
+  webhook_url:
+    description: 'The HTTP URI of the webhook endpoint to invoke'
+    required: true
+  webhook_secret:
+    description: 'Optional secret to sign the webhook payload. Defaults to webhook_url when omitted.'
+    required: false
+  webhook_auth:
+    description: 'Optional authentication value. Supports basic credentials (username:password), bearer tokens, or custom headers.'
+    required: false
+  webhook_auth_type:
+    description: 'Authentication strategy: basic (default), bearer, or header.'
+    required: false
+    default: basic
+  webhook_type:
+    description: 'json | form-urlencoded | json-extended'
+    required: false
+  verbose:
+    description: 'Emit verbose curl output.'
+    required: false
+  silent:
+    description: 'Suppress output noise.'
+    required: false
+  timeout:
+    description: 'Seconds to wait for the connection to establish.'
+    required: false
+  max_time:
+    description: 'Maximum number of seconds the entire request may take.'
+    required: false
+  curl_opts:
+    description: 'Additional curl options.'
+    required: false
+  verify_ssl:
+    description: 'Set to false to disable SSL verification.'
+    required: false
+    default: 'true'
+  event_name:
+    description: 'Optional event name override.'
+    required: false
+  data:
+    description: 'JSON payload string to append under the data property.'
+    required: false
+outputs:
+  response-body:
+    description: 'Body returned by the webhook request.'
+runs:
+  using: docker
+  image: 'docker://ghcr.io/mycarrier-devops/actions/send-webhook:v1.0.0'
