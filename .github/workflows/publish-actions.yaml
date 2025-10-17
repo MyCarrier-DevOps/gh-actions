@@ -1,0 +1,283 @@
+name: Publish Actions
+
+# This workflow publishes GitHub Actions to GHCR with automatic versioning.
+# Requires a GitHub App for bypassing repository rules.
+# 
+# Required Secrets:
+#   - APP_ID: GitHub App ID
+#   - APP_PRIVATE_KEY: GitHub App private key (PEM format)
+#
+# The GitHub App must have the following permissions:
+#   - Repository: contents (read & write)
+#   - Repository: packages (read & write)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/actions/**'
+  workflow_dispatch:
+    inputs:
+      action_name:
+        description: 'Specific action to publish (leave empty for all changed)'
+        required: false
+        type: string
+      version_bump:
+        description: 'Version bump type'
+        required: false
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    # Skip if the commit was made by github-actions bot to prevent infinite loops
+    if: github.event.head_commit.author.email != 'github-actions[bot]@users.noreply.github.com'
+    outputs:
+      actions: ${{ steps.detect.outputs.actions }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed actions
+        id: detect
+        run: |
+          set -euo pipefail
+          
+          # Get list of all actions
+          all_actions=$(find .github/actions -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ inputs.action_name }}" ]; then
+            # Manual trigger with specific action
+            changed_actions="[\"${{ inputs.action_name }}\"]"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Manual trigger without specific action - publish all
+            changed_actions="$all_actions"
+          else
+            # Auto trigger - detect changes
+            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              # First push to branch
+              changed_actions="$all_actions"
+            else
+              # Get changed files
+              changed_files=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^.github/actions/' || true)
+              
+              if [ -z "$changed_files" ]; then
+                changed_actions="[]"
+              else
+                # Extract action names from changed paths
+                changed_actions=$(echo "$changed_files" | sed 's|^.github/actions/\([^/]*\)/.*|\1|' | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              fi
+            fi
+          fi
+          
+          echo "actions=$changed_actions" >> "$GITHUB_OUTPUT"
+          echo "Changed actions: $changed_actions"
+
+  publish:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.actions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        action: ${{ fromJSON(needs.detect-changes.outputs.actions) }}
+      fail-fast: false
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase repository owner
+        id: repo
+        run: |
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Read and increment version
+        id: version
+        run: |
+          set -euo pipefail
+          
+          action_dir=".github/actions/${{ matrix.action }}"
+          version_file="$action_dir/VERSION"
+          
+          if [ ! -f "$version_file" ]; then
+            echo "1.0.0" > "$version_file"
+          fi
+          
+          current_version=$(cat "$version_file")
+          echo "current=$current_version" >> "$GITHUB_OUTPUT"
+          
+          # Parse version
+          IFS='.' read -r major minor patch <<< "$current_version"
+          
+          # Determine bump type
+          bump_type="${{ inputs.version_bump }}"
+          if [ -z "$bump_type" ]; then
+            bump_type="patch"
+          fi
+          
+          # Increment version
+          case "$bump_type" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+          esac
+          
+          new_version="${major}.${minor}.${patch}"
+          echo "$new_version" > "$version_file"
+          echo "new=$new_version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          
+          echo "Version: $current_version -> $new_version"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .github/actions/${{ matrix.action }}
+          file: .github/actions/${{ matrix.action }}/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:latest
+            ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.new }}
+            ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.major }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=${{ matrix.action }}
+            org.opencontainers.image.description=GitHub Action: ${{ matrix.action }}
+            org.opencontainers.image.version=${{ steps.version.outputs.new }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Update action.yml to use published image
+        run: |
+          set -euo pipefail
+          
+          action_file=".github/actions/${{ matrix.action }}/action.yml"
+          
+          # Update action.yml to reference published image
+          # This handles both initial publish (Dockerfile) and updates (existing docker:// reference)
+          if grep -q "image: Dockerfile" "$action_file"; then
+            sed -i.bak "s|image: Dockerfile|image: 'docker://ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.new }}'|" "$action_file"
+            rm "${action_file}.bak"
+          elif grep -q "image: 'docker://ghcr.io" "$action_file"; then
+            sed -i.bak "s|image: 'docker://ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v[^']*'|image: 'docker://ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.new }}'|" "$action_file"
+            rm "${action_file}.bak"
+          fi
+
+      - name: Commit version and action.yml changes
+        run: |
+          set -euo pipefail
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add .github/actions/${{ matrix.action }}/VERSION
+          git add .github/actions/${{ matrix.action }}/action.yml
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(${{ matrix.action }}): bump version to ${{ steps.version.outputs.new }} [skip ci]" --no-verify
+            git push origin main --no-verify
+          fi
+
+      - name: Create Git tag
+        run: |
+          set -euo pipefail
+          
+          tag_name="${{ matrix.action }}/v${{ steps.version.outputs.new }}"
+          major_tag="${{ matrix.action }}/v${{ steps.version.outputs.major }}"
+          
+          # Create and push version tag
+          git tag -a "$tag_name" -m "Release ${{ matrix.action }} v${{ steps.version.outputs.new }}"
+          git push origin "$tag_name" --no-verify
+          
+          # Force update major version tag
+          git tag -fa "$major_tag" -m "Release ${{ matrix.action }} v${{ steps.version.outputs.major }}"
+          git push -f origin "$major_tag" --no-verify
+          
+          echo "Created tags: $tag_name, $major_tag"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          
+          tag_name="${{ matrix.action }}/v${{ steps.version.outputs.new }}"
+          
+          # Create release notes
+          cat > release_notes.md << 'EOF'
+          ## ${{ matrix.action }} v${{ steps.version.outputs.new }}
+          
+          ### Docker Image
+          ```
+          ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.new }}
+          ```
+          
+          ### Usage
+          
+          #### Use from this repository:
+          ```yaml
+          - uses: ${{ github.repository }}/.github/actions/${{ matrix.action }}@${{ matrix.action }}/v${{ steps.version.outputs.new }}
+          ```
+          
+          #### Use the published container image directly:
+          ```yaml
+          - uses: docker://ghcr.io/${{ steps.repo.outputs.owner }}/actions/${{ matrix.action }}:v${{ steps.version.outputs.new }}
+          ```
+          
+          #### Use the major version tag (auto-updates):
+          ```yaml
+          - uses: ${{ github.repository }}/.github/actions/${{ matrix.action }}@${{ matrix.action }}/v${{ steps.version.outputs.major }}
+          ```
+          EOF
+          
+          # Create the release
+          gh release create "$tag_name" \
+            --title "${{ matrix.action }} v${{ steps.version.outputs.new }}" \
+            --notes-file release_notes.md
+          
+          rm release_notes.md
+          
+          echo "Created release: $tag_name"
